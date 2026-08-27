@@ -1,0 +1,26 @@
+name: Server tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "fix/tool-call-id-hash"
+
+jobs:
+  test:
+    name: cargo test (server)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Unit tests for tool call ID normalization
+        run: cargo test -p cursor-server --lib model::inference
+
+      - name: Provider stream integration tests
+        run: cargo test -p cursor-server --test provider_stream

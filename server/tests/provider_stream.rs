@@ -3,11 +3,11 @@ use cursor_server::{
     config::{ProviderConfig, ProviderKind},
     model::{
         ContentPart, ModelInvocation, ModelLatency, ModelRequest, ModelSpec, ProjectedContent,
-        ProjectedMessage, PromptSpec, Role, Usage,
+        ProjectedMessage, PromptSpec, Role, ToolCallContent, ToolResultContent, Usage,
     },
     provider::{
-        FinishReason, ModelEvent, OpenAiChatProvider, OpenAiResponsesProvider, Provider,
-        ProviderStream,
+        build_provider, FinishReason, ModelEvent, OpenAiChatProvider, OpenAiResponsesProvider,
+        Provider, ProviderStream,
     },
     run::{consume_model_cycle, RunFailure},
 };
@@ -175,6 +175,75 @@ async fn duplicate_tool_call_ids_are_rejected_across_distinct_indexes() {
     .unwrap_err();
 
     assert!(matches!(failure.failure, RunFailure::Protocol(_)));
+}
+
+#[tokio::test]
+async fn anthropic_preserves_long_tool_call_ids_through_provider_builder() {
+    let (base_url, mut requests, server) = fixture_server(
+        "/v1/messages",
+        concat!(
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {}\n\n",
+        ),
+    )
+    .await;
+    let provider = build_provider(&config(ProviderKind::Anthropic, base_url, None)).unwrap();
+    let call_id = "a".repeat(300);
+    let request = invocation_with_tool_exchange(&call_id);
+
+    let _ = collect(provider.stream(request, CancellationToken::new())).await;
+    let body = requests.recv().await.unwrap();
+    server.abort();
+
+    assert_eq!(body["messages"][0]["content"][0]["id"], call_id);
+    assert_eq!(body["messages"][1]["content"][0]["tool_use_id"], call_id);
+}
+
+#[tokio::test]
+async fn openai_chat_shortens_tool_call_ids_through_provider_builder() {
+    let (base_url, mut requests, server) = fixture_server(
+        "/v1/chat/completions",
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ),
+    )
+    .await;
+    let provider = build_provider(&config(ProviderKind::OpenAiChat, base_url, None)).unwrap();
+    let request = invocation_with_tool_exchange(&"a".repeat(80));
+
+    let _ = collect(provider.stream(request, CancellationToken::new())).await;
+    let body = requests.recv().await.unwrap();
+    server.abort();
+
+    let shortened = body["messages"][1]["tool_calls"][0]["id"].as_str().unwrap();
+    assert_shortened_tool_call_id(shortened);
+    assert_eq!(body["messages"][2]["tool_call_id"], shortened);
+}
+
+#[tokio::test]
+async fn openai_responses_shortens_tool_call_ids_through_provider_builder() {
+    let (base_url, mut requests, server) = fixture_server(
+        "/v1/responses",
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+    )
+    .await;
+    let provider = build_provider(&config(ProviderKind::OpenAiResponses, base_url, None)).unwrap();
+    let request = invocation_with_tool_exchange(&"a".repeat(80));
+
+    let _ = collect(provider.stream(request, CancellationToken::new())).await;
+    let body = requests.recv().await.unwrap();
+    server.abort();
+
+    let shortened = body["input"][0]["call_id"].as_str().unwrap();
+    assert_shortened_tool_call_id(shortened);
+    assert_eq!(body["input"][1]["call_id"], shortened);
+}
+
+fn assert_shortened_tool_call_id(call_id: &str) {
+    assert!(call_id.starts_with("call_"), "unexpected id: {call_id}");
+    assert_eq!(call_id.len(), 29);
+    assert!(call_id.is_ascii());
 }
 
 #[tokio::test]
@@ -913,6 +982,40 @@ async fn every_provider_can_be_cancelled_while_waiting_for_response_headers() {
         assert!(events.is_empty());
         server.abort();
     }
+}
+
+fn invocation_with_tool_exchange(call_id: &str) -> ModelInvocation {
+    let mut invocation = invocation();
+    invocation.request.history = vec![
+        ProjectedMessage {
+            message_id: "assistant-tool-call".into(),
+            role: Role::Assistant,
+            content: ProjectedContent::Assistant {
+                text: String::new(),
+                thinking: String::new(),
+                replay_state: None,
+                calls: vec![ToolCallContent {
+                    index: 0,
+                    call_id: call_id.into(),
+                    name: "Read".into(),
+                    arguments: serde_json::json!({"path": "README.md"}),
+                }],
+            },
+        },
+        ProjectedMessage {
+            message_id: "tool-result".into(),
+            role: Role::Tool,
+            content: ProjectedContent::ToolResult(ToolResultContent {
+                call_id: call_id.into(),
+                name: "Read".into(),
+                content: "done".into(),
+                is_error: false,
+                image: None,
+                provider_parts: Vec::new(),
+            }),
+        },
+    ];
+    invocation
 }
 
 fn invocation() -> ModelInvocation {

@@ -157,15 +157,15 @@ fn build_inner(
             .build()?,
     };
     let provider: Arc<dyn Provider> = match config.kind {
-        ProviderKind::OpenAiChat => {
-            Arc::new(OpenAiChatProvider::new(client, config.clone()).with_recorder(recorder))
-        }
-        ProviderKind::OpenAiResponses => {
-            Arc::new(OpenAiResponsesProvider::new(client, config.clone()).with_recorder(recorder))
-        }
+        ProviderKind::OpenAiChat => Arc::new(NormalizedProvider::new(Arc::new(
+            OpenAiChatProvider::new(client, config.clone()).with_recorder(recorder),
+        ))),
+        ProviderKind::OpenAiResponses => Arc::new(NormalizedProvider::new(Arc::new(
+            OpenAiResponsesProvider::new(client, config.clone()).with_recorder(recorder),
+        ))),
         ProviderKind::Anthropic => {
             Arc::new(AnthropicProvider::new(client, config.clone()).with_recorder(recorder))
         }
     };
-    Ok(Arc::new(NormalizedProvider::new(provider)))
+    Ok(provider)
 }

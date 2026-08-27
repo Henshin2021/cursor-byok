@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{ModelSpec, ProjectedContent, ProjectedMessage, ToolDefinition};
 
-const PROVIDER_TOOL_CALL_ID_MAX_CHARS: usize = 256;
+const PROVIDER_TOOL_CALL_ID_MAX_BYTES: usize = 64;
+const PROVIDER_TOOL_CALL_ID_DIGEST_BYTES: usize = 12;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PromptSpec {
@@ -31,56 +33,45 @@ pub(crate) fn normalize_provider_tool_call_ids(history: &mut [ProjectedMessage])
         match &mut message.content {
             ProjectedContent::Assistant { calls, .. } => {
                 for call in calls {
-                    truncate_tool_call_id(&mut call.call_id);
+                    shorten_tool_call_id(&mut call.call_id);
                 }
             }
             ProjectedContent::ToolResult(result) => {
-                truncate_tool_call_id(&mut result.call_id);
+                shorten_tool_call_id(&mut result.call_id);
             }
             ProjectedContent::Parts(_) => {}
         }
     }
 }
 
-fn truncate_tool_call_id(call_id: &mut String) {
-    if let Some((end, _)) = call_id.char_indices().nth(PROVIDER_TOOL_CALL_ID_MAX_CHARS) {
-        call_id.truncate(end);
+fn shorten_tool_call_id(call_id: &mut String) {
+    if call_id.len() <= PROVIDER_TOOL_CALL_ID_MAX_BYTES {
+        return;
     }
+    let digest = Sha256::digest(call_id.as_bytes());
+    *call_id = format!(
+        "call_{}",
+        hex::encode(&digest[..PROVIDER_TOOL_CALL_ID_DIGEST_BYTES])
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_provider_tool_call_ids;
+    use super::{normalize_provider_tool_call_ids, PROVIDER_TOOL_CALL_ID_MAX_BYTES};
     use crate::model::{
         ProjectedContent, ProjectedMessage, Role, ToolCallContent, ToolResultContent,
     };
 
     #[test]
-    fn provider_tool_call_ids_are_truncated_once_for_every_provider() {
-        let call_id = format!("cursor-tool-call:{}", "x".repeat(260));
-        assert_eq!(call_id.len(), 277);
-        let expected = call_id[..256].to_string();
+    fn long_provider_tool_call_ids_map_to_one_short_id_across_history() {
+        let call_id = format!("cursor-tool-call:{}", "x".repeat(80));
         let mut history = vec![
-            ProjectedMessage {
-                message_id: "assistant".into(),
-                role: Role::Assistant,
-                content: ProjectedContent::Assistant {
-                    text: String::new(),
-                    thinking: String::new(),
-                    replay_state: None,
-                    calls: vec![ToolCallContent {
-                        index: 0,
-                        call_id: call_id.clone(),
-                        name: "Shell".into(),
-                        arguments: serde_json::json!({}),
-                    }],
-                },
-            },
+            assistant_with_call(&call_id),
             ProjectedMessage {
                 message_id: "result".into(),
                 role: Role::Tool,
                 content: ProjectedContent::ToolResult(ToolResultContent {
-                    call_id,
+                    call_id: call_id.clone(),
                     name: "Shell".into(),
                     content: "done".into(),
                     is_error: false,
@@ -92,20 +83,56 @@ mod tests {
 
         normalize_provider_tool_call_ids(&mut history);
 
-        let ProjectedContent::Assistant { calls, .. } = &history[0].content else {
-            panic!("expected assistant message");
-        };
+        let shortened = first_call_id(&history[0]);
         let ProjectedContent::ToolResult(result) = &history[1].content else {
             panic!("expected tool result");
         };
-        assert_eq!(calls[0].call_id, expected);
-        assert_eq!(result.call_id, expected);
+        assert_eq!(result.call_id, shortened);
+        assert_eq!(shortened.len(), 29);
+        assert!(shortened.starts_with("call_"));
+        assert!(shortened.is_ascii());
     }
 
     #[test]
-    fn provider_tool_call_id_truncation_counts_unicode_characters() {
-        let mut history = vec![ProjectedMessage {
-            message_id: "assistant".into(),
+    fn ids_within_the_limit_are_left_untouched() {
+        let call_id = "x".repeat(PROVIDER_TOOL_CALL_ID_MAX_BYTES);
+        let mut history = vec![assistant_with_call(&call_id)];
+
+        normalize_provider_tool_call_ids(&mut history);
+
+        assert_eq!(first_call_id(&history[0]), call_id);
+    }
+
+    #[test]
+    fn ids_sharing_a_long_prefix_stay_distinct() {
+        let prefix = "x".repeat(80);
+        let mut history = vec![
+            assistant_with_call(&format!("{prefix}a")),
+            assistant_with_call(&format!("{prefix}b")),
+        ];
+
+        normalize_provider_tool_call_ids(&mut history);
+
+        assert_ne!(first_call_id(&history[0]), first_call_id(&history[1]));
+    }
+
+    #[test]
+    fn multi_byte_ids_are_measured_in_bytes_and_become_ascii() {
+        let call_id = "界".repeat(30);
+        assert!(call_id.chars().count() < PROVIDER_TOOL_CALL_ID_MAX_BYTES);
+        assert!(call_id.len() > PROVIDER_TOOL_CALL_ID_MAX_BYTES);
+        let mut history = vec![assistant_with_call(&call_id)];
+
+        normalize_provider_tool_call_ids(&mut history);
+
+        let shortened = first_call_id(&history[0]);
+        assert!(shortened.is_ascii());
+        assert!(shortened.len() <= PROVIDER_TOOL_CALL_ID_MAX_BYTES);
+    }
+
+    fn assistant_with_call(call_id: &str) -> ProjectedMessage {
+        ProjectedMessage {
+            message_id: format!("assistant-{call_id}"),
             role: Role::Assistant,
             content: ProjectedContent::Assistant {
                 text: String::new(),
@@ -113,18 +140,18 @@ mod tests {
                 replay_state: None,
                 calls: vec![ToolCallContent {
                     index: 0,
-                    call_id: format!("{}界y", "x".repeat(255)),
-                    name: "Read".into(),
+                    call_id: call_id.into(),
+                    name: "Shell".into(),
                     arguments: serde_json::json!({}),
                 }],
             },
-        }];
+        }
+    }
 
-        normalize_provider_tool_call_ids(&mut history);
-
-        let ProjectedContent::Assistant { calls, .. } = &history[0].content else {
+    fn first_call_id(message: &ProjectedMessage) -> String {
+        let ProjectedContent::Assistant { calls, .. } = &message.content else {
             panic!("expected assistant message");
         };
-        assert_eq!(calls[0].call_id, format!("{}界", "x".repeat(255)));
+        calls[0].call_id.clone()
     }
 }
